@@ -1,0 +1,890 @@
+import { useState, useCallback, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { supabase } from "@/integrations/supabase/client";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { GraduationCap, Trophy, Flame, BookOpen, LogOut, Award, CheckCircle, X, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
+import ReactMarkdown from 'react-markdown';
+
+type QuizQuestion = {
+  id: string;
+  question: string;
+  options: string[];
+  correct_answer: string;
+};
+
+type Module = {
+  id: string;
+  user_id: string;
+  module_id: string;
+  title: string;
+  description: string;
+  difficulty: string;
+  estimated_duration: number;
+  points_reward: number;
+  progress_percentage: number;
+  is_completed: boolean;
+  detailed_content: string | null;
+  interest?: string;
+  quizzes?: QuizQuestion[];
+};
+
+// Custom Progress component with status colors
+const ColoredProgress = ({ value, className = "" }: { value: number; className?: string }) => {
+  const getProgressColorClass = (val: number) => {
+    if (val === 100) return "bg-green-500";
+    if (val === 0) return "bg-yellow-500";
+    return "bg-blue-500";
+  };
+
+  return (
+    <div className={`relative h-2 w-full overflow-hidden rounded-full bg-secondary ${className}`}>
+      <div
+        className={`h-full w-full flex-1 transition-all ${getProgressColorClass(value)}`}
+        style={{ transform: `translateX(-${100 - (value || 0)}%)` }}
+      />
+    </div>
+  );
+};
+
+const Dashboard = () => {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [selectedModule, setSelectedModule] = useState<Module | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [quizResults, setQuizResults] = useState<Record<string, boolean>>({});
+  const [completedQuizzes, setCompletedQuizzes] = useState<Set<string>>(new Set());
+  const [loadingQuizzes, setLoadingQuizzes] = useState<boolean>(false);
+
+  // Fetch session
+  const { data: session } = useQuery({
+    queryKey: ['session'],
+    queryFn: async () => {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) throw error;
+      if (!data.session) {
+        navigate("/auth");
+        return null;
+      }
+      return data.session;
+    },
+  });
+
+  const userId = session?.user?.id;
+
+  // Fetch profile
+  const { 
+    data: profile, 
+    isLoading: isProfileLoading,
+    error: profileError 
+  } = useQuery({
+    queryKey: ['profile', userId],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", userId)
+        .single();
+      
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!userId,
+  });
+
+  // Fetch modules with deduplication
+  const { 
+    data: modules = [], 
+    isLoading: isModulesLoading,
+    error: modulesError,
+    refetch: refetchModules 
+  } = useQuery({
+    queryKey: ['modules', userId],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("user_module_progress")
+        .select("*")
+        .eq("user_id", userId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      if (!data) return [];
+
+      // Remove duplicates by module_id
+      const uniqueModules = data.reduce((acc: Module[], current) => {
+        const existingIndex = acc.findIndex(module => module.module_id === current.module_id);
+        
+        if (existingIndex === -1) {
+          acc.push(current);
+        } else {
+          const existing = acc[existingIndex];
+          if (current.is_completed && !existing.is_completed) {
+            acc[existingIndex] = current;
+          } else if (current.progress_percentage > existing.progress_percentage) {
+            acc[existingIndex] = current;
+          }
+        }
+        return acc;
+      }, []);
+
+      return uniqueModules;
+    },
+    enabled: !!userId,
+  });
+
+  // Calculate points reward
+  const calculatePointsReward = useCallback((duration: number, difficulty: string): number => {
+    const basePoints = Math.round(duration / 10);
+    const difficultyMultiplier = {
+      beginner: 1,
+      intermediate: 1.5,
+      advanced: 2
+    };
+    const multiplier = difficultyMultiplier[difficulty as keyof typeof difficultyMultiplier] || 1;
+    const calculatedPoints = Math.round(basePoints * multiplier);
+    return Math.max(5, Math.round(calculatedPoints / 5) * 5);
+  }, []);
+
+  // Memoized modules with consistent points
+  const modulesWithConsistentPoints = useMemo(() => {
+    return modules.map(module => ({
+      ...module,
+      points_reward: module.points_reward > 0 ? module.points_reward : calculatePointsReward(module.estimated_duration, module.difficulty)
+    }));
+  }, [modules, calculatePointsReward]);
+
+  // Get status text based on progress
+  const getStatusText = useCallback((module: Module) => {
+    if (module.is_completed) return 'Completed';
+    if (module.progress_percentage === 0) return 'Not Started';
+    return 'In Progress';
+  }, []);
+
+  // Get status color for badges
+  const getStatusColor = useCallback((module: Module) => {
+    if (module.is_completed) return 'bg-green-100 text-green-800 border-green-200';
+    if (module.progress_percentage === 0) return 'bg-yellow-100 text-yellow-800 border-yellow-200';
+    return 'bg-blue-100 text-blue-800 border-blue-200';
+  }, []);
+
+  // Generate new modules mutation
+  const generateModulesMutation = useMutation({
+    mutationFn: async (userId: string) => {
+      const response = await fetch("/api/generateModules", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId }),
+      });
+      
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      
+      const result = await response.json();
+      
+      if (result.modules && result.modules.length > 0) {
+        const modulesWithInitialState = result.modules.map((module: Module) => {
+          const consistentPoints = calculatePointsReward(module.estimated_duration, module.difficulty);
+          return {
+            ...module,
+            progress_percentage: 0,
+            is_completed: false,
+            points_reward: consistentPoints
+          };
+        });
+        
+        // Save to database
+        const modulesToInsert = modulesWithInitialState.map(module => ({
+          user_id: userId,
+          module_id: module.id,
+          title: module.title,
+          description: module.description,
+          difficulty: module.difficulty,
+          estimated_duration: module.estimated_duration,
+          points_reward: module.points_reward,
+          progress_percentage: 0,
+          is_completed: false,
+          detailed_content: module.detailed_content
+        }));
+
+        const { error } = await supabase
+          .from("user_module_progress")
+          .insert(modulesToInsert);
+
+        if (error) {
+          if (error.code === '23505') {
+            throw new Error("Modules already exist");
+          }
+          throw error;
+        }
+
+        return modulesWithInitialState;
+      }
+      throw new Error("No modules returned from API");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modules'] });
+      toast.success("Learning modules generated successfully!");
+    },
+    onError: (error: any) => {
+      if (error.message === "Modules already exist") {
+        toast.info("Modules already exist, loading current progress");
+        queryClient.invalidateQueries({ queryKey: ['modules'] });
+      } else {
+        toast.error(`Failed to generate learning modules: ${error.message}`);
+      }
+    },
+  });
+
+  // Complete module mutation
+  const completeModuleMutation = useMutation({
+    mutationFn: async ({ module, profile }: { module: Module; profile: any }) => {
+      // Update module progress
+      const { error: moduleError } = await supabase
+        .from("user_module_progress")
+        .update({ 
+          progress_percentage: 100, 
+          is_completed: true 
+        })
+        .eq("module_id", module.module_id)
+        .eq("user_id", profile.id);
+
+      if (moduleError) throw moduleError;
+
+      // Award points
+      const newPoints = (profile.total_points || 0) + module.points_reward;
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .update({ total_points: newPoints })
+        .eq("id", profile.id);
+
+      if (profileError) throw profileError;
+
+      return newPoints;
+    },
+    onSuccess: (newPoints, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['profile'] });
+      queryClient.invalidateQueries({ queryKey: ['modules'] });
+      toast.success(`Module completed! 🎉 +${variables.module.points_reward} points earned!`);
+    },
+    onError: (error: any) => {
+      toast.error(`Failed to complete module: ${error.message}`);
+    }
+  });
+
+  // Generate quizzes for module
+  const generateQuizzesForModule = async (module: Module): Promise<QuizQuestion[]> => {
+    setLoadingQuizzes(true);
+    try {
+      const response = await fetch("/api/generateQuizzes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          moduleTitle: module.title,
+          moduleContent: module.detailed_content || module.description,
+          difficulty: module.difficulty
+        }),
+      });
+      
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      
+      const result = await response.json();
+
+      if (result.quizzes && result.quizzes.length > 0) {
+        return result.quizzes;
+      } else {
+        throw new Error("No quizzes returned from API");
+      }
+    } catch (err: any) {
+      console.error("Error generating quizzes:", err);
+      // Fallback quizzes
+      return [
+        {
+          id: `quiz_${module.id}_1`,
+          question: `What is the main focus of ${module.title}?`,
+          options: [
+            "Understanding fundamental concepts and practical applications",
+            "Advanced technical details and complex theories", 
+            "Historical background and development",
+            "Future predictions and trends"
+          ],
+          correct_answer: "Understanding fundamental concepts and practical applications"
+        },
+        {
+          id: `quiz_${module.id}_2`,
+          question: `Which approach is most effective for learning ${module.title}?`,
+          options: [
+            "Regular practice and hands-on exercises",
+            "Theoretical study and memorization",
+            "Advanced tools and software",
+            "Professional certifications"
+          ],
+          correct_answer: "Regular practice and hands-on exercises"
+        }
+      ];
+    } finally {
+      setLoadingQuizzes(false);
+    }
+  };
+
+  // Module handlers
+  const openModule = useCallback(async (module: Module) => {
+    setSelectedModule(module);
+    
+    // For completed modules, preserve the answers and quiz results
+    if (!module.is_completed) {
+      setAnswers({});
+      setQuizResults({});
+      setCompletedQuizzes(new Set());
+    }
+
+    // Generate quizzes if needed (only for incomplete modules)
+    if ((!module.quizzes || module.quizzes.length === 0) && !module.is_completed) {
+      try {
+        const quizzes = await generateQuizzesForModule(module);
+        setSelectedModule(prev => prev ? { ...prev, quizzes } : null);
+      } catch (err) {
+        console.error("Failed to generate quizzes:", err);
+        toast.error("Failed to load quizzes. Please try again.");
+      }
+    }
+  }, []);
+
+  const closeModule = useCallback(() => {
+    setSelectedModule(null);
+    setLoadingQuizzes(false);
+  }, []);
+
+  const markModuleComplete = useCallback(async () => {
+    if (!selectedModule || !profile) {
+      toast.error("No module or profile selected");
+      return;
+    }
+
+    if (selectedModule.is_completed) {
+      toast.info("This module is already completed!");
+      return;
+    }
+
+    completeModuleMutation.mutate({ module: selectedModule, profile });
+  }, [selectedModule, profile, completeModuleMutation]);
+
+  // Quiz handlers
+  const handleAnswerSelect = useCallback((quizId: string, answer: string) => {
+    if (selectedModule?.is_completed) {
+      toast.info("This module is completed. You cannot change answers.");
+      return;
+    }
+    setAnswers(prev => ({ ...prev, [quizId]: answer }));
+  }, [selectedModule]);
+
+  const submitQuizAnswer = useCallback(async (quiz: QuizQuestion) => {
+    if (!selectedModule || selectedModule.is_completed) {
+      toast.info("This module is completed. You cannot submit answers.");
+      return;
+    }
+
+    const userAnswer = answers[quiz.id];
+    if (!userAnswer) {
+      toast.error("Please select an answer");
+      return;
+    }
+
+    const isCorrect = userAnswer === quiz.correct_answer;
+    setQuizResults(prev => ({ ...prev, [quiz.id]: isCorrect }));
+    setCompletedQuizzes(prev => new Set(prev).add(quiz.id));
+
+    if (isCorrect) {
+      toast.success("✅ Correct answer!");
+      
+      // Award quiz points
+      const quizPoints = 5;
+      const newPoints = (profile?.total_points || 0) + quizPoints;
+      
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .update({ total_points: newPoints })
+        .eq("id", profile.id);
+
+      if (!profileError) {
+        queryClient.invalidateQueries({ queryKey: ['profile'] });
+      }
+
+      // Update progress
+      const moduleQuizzes = selectedModule.quizzes || [];
+      const completedCount = completedQuizzes.size + 1;
+      const progressPercentage = Math.min(
+        Math.floor((completedCount / moduleQuizzes.length) * 100),
+        100
+      );
+
+      const { error } = await supabase
+        .from("user_module_progress")
+        .update({ progress_percentage: progressPercentage })
+        .eq("module_id", selectedModule.module_id)
+        .eq("user_id", profile.id);
+
+      if (!error) {
+        queryClient.invalidateQueries({ queryKey: ['modules'] });
+        
+        if (progressPercentage === 100 && !selectedModule.is_completed) {
+          setTimeout(() => {
+            toast.success("All quizzes completed! Module finished! 🎉");
+          }, 1000);
+        }
+      }
+    } else {
+      toast.error("❌ Incorrect answer. Try again!");
+    }
+  }, [selectedModule, answers, profile, completedQuizzes, queryClient]);
+
+  // Helper function for read-only quiz display
+  const getReadOnlyOptionColor = useCallback((option: string, quiz: QuizQuestion, userAnswer: string | undefined) => {
+    if (option === quiz.correct_answer) return 'bg-green-50 border-green-200 text-green-800';
+    if (userAnswer && option === userAnswer && option !== quiz.correct_answer) return 'bg-red-50 border-red-200 text-red-800';
+    return 'bg-gray-50 border-gray-200 text-gray-600';
+  }, []);
+
+  const calculateDayStreak = useCallback(() => profile?.streak_days || 0, [profile]);
+
+  const loading = isProfileLoading || isModulesLoading;
+
+  if (loading) return (
+    <div className="min-h-screen flex items-center justify-center">
+      <div className="animate-pulse text-2xl text-primary">Loading...</div>
+    </div>
+  );
+
+  if (profileError || modulesError) return (
+    <div className="min-h-screen flex items-center justify-center">
+      <div className="text-center">
+        <h2 className="text-2xl font-bold text-red-600 mb-4">Error Loading Data</h2>
+        <p className="text-muted-foreground mb-4">
+          {profileError?.message || modulesError?.message}
+        </p>
+        <Button onClick={() => window.location.reload()}>
+          Retry
+        </Button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-primary/5 via-background to-secondary/5">
+      {/* Header */}
+      <header className="border-b bg-card/50 backdrop-blur-sm sticky top-0 z-50">
+        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-xl bg-gradient-to-br from-primary to-warning">
+              <GraduationCap className="h-6 w-6 text-primary-foreground" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold">AI Learn Tanzania</h1>
+              <p className="text-sm text-muted-foreground">Welcome, {profile?.full_name || 'User'}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => refetchModules()}
+              disabled={isModulesLoading}
+            >
+              <RefreshCw className={`h-4 w-4 mr-2 ${isModulesLoading ? 'animate-spin' : ''}`} />
+              Refresh
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => supabase.auth.signOut().then(() => navigate("/auth"))}
+            >
+              <LogOut className="h-4 w-4 mr-2" /> Sign Out
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      {/* Stats */}
+      <main className="container mx-auto px-4 py-8">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+          <Card>
+            <CardContent className="pt-6 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Total Points</p>
+                <p className="text-3xl font-bold text-primary">{profile?.total_points || 0}</p>
+              </div>
+              <Trophy className="h-6 w-6 text-primary p-3 rounded-full bg-primary/10" />
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Day Streak</p>
+                <p className="text-3xl font-bold text-warning">{calculateDayStreak()}</p>
+              </div>
+              <Flame className="h-6 w-6 text-warning p-3 rounded-full bg-warning/10" />
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Skill Level</p>
+                <Badge variant="secondary">{profile?.skill_level || "beginner"}</Badge>
+              </div>
+              <Award className="h-6 w-6 text-secondary p-3 rounded-full bg-secondary/10" />
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Learning Modules */}
+        <div className="space-y-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-2xl font-bold flex items-center gap-2">
+              <BookOpen className="h-6 w-6 text-primary" /> Your Learning Path
+            </h2>
+            <div className="text-sm text-muted-foreground">
+              {modulesWithConsistentPoints.length} module(s)
+            </div>
+          </div>
+
+          {modulesWithConsistentPoints.length === 0 ? (
+            <Card>
+              <CardContent className="pt-6 text-center py-12">
+                <BookOpen className="h-16 w-16 mx-auto mb-4 text-muted-foreground opacity-50" />
+                <h3 className="text-lg font-semibold mb-2">No Learning Modules Yet</h3>
+                <p className="text-muted-foreground mb-6 max-w-md mx-auto">
+                  Get started by generating your personalized learning modules based on your interests and skill level.
+                </p>
+                <Button 
+                  onClick={() => profile && generateModulesMutation.mutate(profile.id)} 
+                  disabled={generateModulesMutation.isPending || !profile}
+                  size="lg"
+                >
+                  {generateModulesMutation.isPending ? (
+                    <>
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                      Generating Modules...
+                    </>
+                  ) : (
+                    "Generate Learning Modules"
+                  )}
+                </Button>
+              </CardContent>
+            </Card>
+          ) : (
+            <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+              {modulesWithConsistentPoints.map((module) => (
+                <ModuleCard 
+                  key={module.id} 
+                  module={module} 
+                  onOpenModule={openModule}
+                  getStatusText={getStatusText}
+                  getStatusColor={getStatusColor}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </main>
+
+      {/* Module Dialog */}
+      <Dialog open={!!selectedModule} onOpenChange={(open) => !open && closeModule()}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center justify-between">
+              <span>{selectedModule?.title}</span>
+              <Button variant="ghost" size="icon" onClick={closeModule}>
+                <X className="h-4 w-4" />
+              </Button>
+            </DialogTitle>
+          </DialogHeader>
+
+          {selectedModule && (
+            <div className="space-y-6">
+              {/* Module Info */}
+              <div className="grid grid-cols-3 gap-4 text-sm">
+                <div className="text-center p-3 bg-muted rounded-lg">
+                  <p className="font-semibold">Duration</p>
+                  <p>{selectedModule.estimated_duration} min</p>
+                </div>
+                <div className="text-center p-3 bg-muted rounded-lg">
+                  <p className="font-semibold">Points Reward</p>
+                  <p>{selectedModule.points_reward}</p>
+                </div>
+                <div className="text-center p-3 bg-muted rounded-lg">
+                  <p className="font-semibold">Your Progress</p>
+                  <p>{selectedModule.progress_percentage}%</p>
+                </div>
+              </div>
+
+              {/* Progress Bar with Status */}
+              <div className="space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span>Module Progress</span>
+                  <span>{selectedModule.progress_percentage}%</span>
+                </div>
+                
+                {/* Progress Bar */}
+                <ColoredProgress 
+                  value={selectedModule.progress_percentage} 
+                  className="w-full"
+                />
+                
+                {/* Status Labels */}
+                <div className="flex justify-between text-xs">
+                  <span className={`px-2 py-1 rounded ${
+                    selectedModule.progress_percentage === 0 
+                      ? 'bg-yellow-100 text-yellow-800 font-medium' 
+                      : 'text-muted-foreground'
+                  }`}>
+                    Not Started
+                  </span>
+                  <span className={`px-2 py-1 rounded ${
+                    selectedModule.progress_percentage > 0 && selectedModule.progress_percentage < 100 
+                      ? 'bg-blue-100 text-blue-800 font-medium' 
+                      : 'text-muted-foreground'
+                  }`}>
+                    In Progress
+                  </span>
+                  <span className={`px-2 py-1 rounded ${
+                    selectedModule.is_completed 
+                      ? 'bg-green-100 text-green-800 font-medium' 
+                      : 'text-muted-foreground'
+                  }`}>
+                    Completed
+                  </span>
+                </div>
+              </div>
+
+              {/* Module Content */}
+              <div className="prose prose-lg max-w-none border rounded-lg p-6 bg-card">
+                {selectedModule.detailed_content ? (
+                  <ReactMarkdown>
+                    {selectedModule.detailed_content}
+                  </ReactMarkdown>
+                ) : (
+                  <div className="text-center text-muted-foreground py-8">
+                    <BookOpen className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                    <p className="text-lg font-semibold mb-2">Learning Content</p>
+                    <p className="mb-4">{selectedModule.description}</p>
+                    <p className="text-sm">
+                      This module focuses on {selectedModule.title.toLowerCase()}. 
+                      Work through the quizzes below to test your understanding.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Quizzes Section */}
+              <div className="border-t pt-6">
+                <h3 className="text-xl font-bold mb-4 text-primary">
+                  Knowledge Check {selectedModule.is_completed && "(Completed)"}
+                </h3>
+
+                {/* Quiz Loading State */}
+                {loadingQuizzes && (
+                  <div className="text-center py-8">
+                    <div className="flex flex-col items-center">
+                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mb-4"></div>
+                      <p className="text-muted-foreground">Loading quizzes...</p>
+                    </div>
+                  </div>
+                )}
+
+                {/* No Quizzes State */}
+                {!loadingQuizzes && (!selectedModule.quizzes || selectedModule.quizzes.length === 0) && (
+                  <div className="text-center py-8">
+                    <BookOpen className="h-12 w-12 mx-auto mb-4 text-muted-foreground opacity-50" />
+                    <p className="text-muted-foreground">
+                      {selectedModule.is_completed 
+                        ? "No quizzes available for this completed module." 
+                        : "No quizzes available yet. Complete the module content first."
+                      }
+                    </p>
+                  </div>
+                )}
+
+                {/* Quizzes Loaded */}
+                {!loadingQuizzes && selectedModule.quizzes && selectedModule.quizzes.length > 0 && (
+                  <div className="space-y-4">
+                    {selectedModule.quizzes.map((quiz) => (
+                      <Card key={quiz.id} className="p-4">
+                        <h4 className="font-semibold mb-3">{quiz.question}</h4>
+                        <div className="space-y-2">
+                          {quiz.options.map((option, index) => (
+                            <label 
+                              key={index} 
+                              className={`flex items-center gap-2 p-3 rounded border transition-colors ${
+                                selectedModule.is_completed 
+                                  ? getReadOnlyOptionColor(option, quiz, answers[quiz.id])
+                                  : answers[quiz.id] === option 
+                                    ? quizResults[quiz.id] === true
+                                      ? 'bg-green-50 border-green-200 text-green-800'
+                                      : quizResults[quiz.id] === false
+                                      ? 'bg-red-50 border-red-200 text-red-800'
+                                      : 'bg-blue-50 border-blue-200 text-blue-800'
+                                    : 'hover:bg-gray-50 cursor-pointer'
+                              }`}
+                            >
+                              <input
+                                type="radio"
+                                name={`quiz-${quiz.id}`}
+                                value={option}
+                                checked={answers[quiz.id] === option}
+                                onChange={() => handleAnswerSelect(quiz.id, option)}
+                                className="mr-2"
+                                disabled={quizResults[quiz.id] !== undefined || selectedModule.is_completed || loadingQuizzes}
+                              />
+                              {option}
+                              {selectedModule.is_completed && option === quiz.correct_answer && (
+                                <CheckCircle className="h-4 w-4 text-green-600 ml-auto" />
+                              )}
+                            </label>
+                          ))}
+                        </div>
+                        {!selectedModule.is_completed && (
+                          <Button
+                            onClick={() => submitQuizAnswer(quiz)}
+                            className="mt-3"
+                            disabled={!answers[quiz.id] || quizResults[quiz.id] !== undefined || loadingQuizzes}
+                          >
+                            {quizResults[quiz.id] !== undefined 
+                              ? quizResults[quiz.id] ? '✓ Correct - +5 points!' : '✗ Incorrect - Try Again' 
+                              : 'Submit Answer'
+                            }
+                          </Button>
+                        )}
+                        {selectedModule.is_completed && answers[quiz.id] && (
+                          <div className="mt-3 p-2 rounded bg-gray-50">
+                            <p className="text-sm">
+                              <strong>Your answer:</strong> {answers[quiz.id]}
+                              {answers[quiz.id] === quiz.correct_answer ? (
+                                <span className="text-green-600 ml-2">✓ Correct</span>
+                              ) : (
+                                <span className="text-red-600 ml-2">✗ Incorrect</span>
+                              )}
+                            </p>
+                          </div>
+                        )}
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Module Completion */}
+              <div className="pt-4 border-t">
+                <Button 
+                  onClick={markModuleComplete}
+                  className="w-full"
+                  size="lg"
+                  disabled={selectedModule.is_completed || completeModuleMutation.isPending || loadingQuizzes}
+                >
+                  {completeModuleMutation.isPending ? (
+                    <>
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                      Completing...
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle className="h-5 w-5 mr-2" />
+                      {selectedModule.is_completed ? "Module Completed" : "Mark Module Complete"}
+                    </>
+                  )}
+                </Button>
+                {selectedModule.is_completed ? (
+                  <p className="text-center text-green-600 mt-2">
+                    ✅ You've completed this module and earned {selectedModule.points_reward} points!
+                  </p>
+                ) : (
+                  <p className="text-center text-muted-foreground text-sm mt-2">
+                    Complete the quizzes above or click to mark this module as complete
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+};
+
+// Memoized Module Card Component
+const ModuleCard = ({ 
+  module, 
+  onOpenModule,
+  getStatusText,
+  getStatusColor
+}: { 
+  module: Module; 
+  onOpenModule: (module: Module) => void;
+  getStatusText: (module: Module) => string;
+  getStatusColor: (module: Module) => string;
+}) => {
+  const statusText = getStatusText(module);
+  const statusColor = getStatusColor(module);
+  
+  return (
+    <Card className="shadow-soft hover:shadow-medium transition-all hover:translate-y-[-2px]">
+      <CardHeader>
+        <div className="flex items-start justify-between">
+          <div className="flex-1">
+            <CardTitle className="text-lg">{module.title}</CardTitle>
+            <CardDescription className="mt-2 line-clamp-2">{module.description}</CardDescription>
+          </div>
+          <div className="flex flex-col items-end gap-2">
+            <Badge variant={module.difficulty === "beginner" ? "secondary" : "default"}>
+              {module.difficulty}
+            </Badge>
+            {module.is_completed && (
+              <CheckCircle className="h-5 w-5 text-green-500" />
+            )}
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent>
+        <div className="flex items-center justify-between mb-4">
+          <ColoredProgress 
+            value={module.progress_percentage} 
+            className="flex-1 mr-4"
+          />
+          <span className="text-sm font-medium">{module.progress_percentage}%</span>
+        </div>
+
+        {/* Status Badge */}
+        <div className="flex items-center justify-between mb-4">
+          <div className={`px-2 py-1 rounded border text-xs font-medium ${statusColor}`}>
+            {statusText}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4 mb-4 text-sm">
+          <div className="text-center p-2 bg-muted rounded-lg">
+            <p className="font-semibold">Duration</p>
+            <p>{module.estimated_duration} min</p>
+          </div>
+          <div className="text-center p-2 bg-muted rounded-lg">
+            <p className="font-semibold">Points</p>
+            <p>{module.points_reward}</p>
+          </div>
+        </div>
+
+        <Button 
+          onClick={() => onOpenModule(module)} 
+          className="w-full"
+          size="lg"
+          variant={module.is_completed ? "outline" : "default"}
+        >
+          <BookOpen className="h-4 w-4 mr-2" />
+          {module.is_completed ? "Review Module" : "Open Module"}
+        </Button>
+      </CardContent>
+    </Card>
+  );
+};
+
+export default Dashboard;

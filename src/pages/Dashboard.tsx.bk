@@ -1,0 +1,568 @@
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { supabase } from "@/integrations/supabase/client";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import { Badge } from "@/components/ui/badge";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { GraduationCap, Trophy, Flame, BookOpen, LogOut, Award, CheckCircle, X } from "lucide-react";
+import { toast } from "sonner";
+import ReactMarkdown from 'react-markdown';
+
+type QuizQuestion = {
+  id: string;
+  question: string;
+  options: string[];
+  correct_answer: string;
+};
+
+type Module = {
+  id: string;
+  user_id: string;
+  module_id: string;
+  title: string;
+  description: string;
+  difficulty: string;
+  estimated_duration: number;
+  points_reward: number;
+  progress_percentage: number;
+  is_completed: boolean;
+  detailed_content: string | null;
+  interest?: string;
+  quizzes?: QuizQuestion[];
+};
+
+const Dashboard = () => {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [selectedModule, setSelectedModule] = useState<Module | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [quizResults, setQuizResults] = useState<Record<string, boolean>>({});
+  const [completedQuizzes, setCompletedQuizzes] = useState<Set<string>>(new Set());
+  const [moduleLoading, setModuleLoading] = useState<string | null>(null);
+  const [completingModule, setCompletingModule] = useState<boolean>(false);
+
+  // Fetch user session and profile
+  const { data: session } = useQuery({
+    queryKey: ['session'],
+    queryFn: async () => {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) throw error;
+      if (!data.session) {
+        navigate("/auth");
+        return null;
+      }
+      return data.session;
+    },
+  });
+
+  // Fetch profile data
+  const { data: profile, isLoading: profileLoading } = useQuery({
+    queryKey: ['profile', session?.user?.id],
+    queryFn: async () => {
+      if (!session?.user?.id) throw new Error("No user session");
+      
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", session.user.id)
+        .single();
+      
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!session?.user?.id,
+  });
+
+  // Fetch modules data
+  const { data: modules = [], isLoading: modulesLoading } = useQuery({
+    queryKey: ['modules', session?.user?.id],
+    queryFn: async () => {
+      if (!session?.user?.id) throw new Error("No user session");
+      
+      const { data, error } = await supabase
+        .from("user_module_progress")
+        .select("*")
+        .eq("user_id", session.user.id);
+
+      if (error) throw error;
+      
+      console.log("📦 Loaded modules from DB:", data);
+      return data as Module[];
+    },
+    enabled: !!session?.user?.id,
+  });
+
+  // Generate new modules mutation
+  const generateModulesMutation = useMutation({
+    mutationFn: async (userId: string) => {
+      console.log("🚀 Generating new modules for user:", userId);
+      
+      const response = await fetch("/api/generateModules", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId }),
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const result = await response.json();
+      console.log("🎯 API Response - Generated modules:", result.modules);
+
+      if (result.modules && result.modules.length > 0) {
+        const modulesWithInitialState = result.modules.map((module: Module) => ({
+          ...module,
+          progress_percentage: 0,
+          is_completed: false
+        }));
+        
+        // Save to database
+        const modulesToInsert = modulesWithInitialState.map(module => {
+          const { interest, ...moduleWithoutInterest } = module;
+          return {
+            user_id: userId,
+            module_id: module.id,
+            title: module.title,
+            description: module.description,
+            difficulty: module.difficulty,
+            estimated_duration: module.estimated_duration,
+            points_reward: module.points_reward,
+            progress_percentage: 0,
+            is_completed: false,
+            detailed_content: module.detailed_content
+          };
+        });
+
+        const { error } = await supabase
+          .from("user_module_progress")
+          .insert(modulesToInsert);
+
+        if (error) {
+          if (error.code === '23505') {
+            // Unique constraint violation - modules already exist
+            throw new Error("Modules already exist");
+          }
+          throw error;
+        }
+
+        return modulesWithInitialState;
+      }
+      throw new Error("No modules returned from API");
+    },
+    onSuccess: () => {
+      // Invalidate and refetch modules
+      queryClient.invalidateQueries({ queryKey: ['modules'] });
+      toast.success("Learning modules generated successfully!");
+    },
+    onError: (error: any) => {
+      console.error("❌ Error generating modules:", error);
+      if (error.message === "Modules already exist") {
+        toast.info("Modules already exist, loading current progress");
+        queryClient.invalidateQueries({ queryKey: ['modules'] });
+      } else {
+        toast.error(`Failed to generate learning modules: ${error.message}`);
+      }
+    },
+  });
+
+  // Mark module as complete mutation
+  const completeModuleMutation = useMutation({
+    mutationFn: async ({ module, profile }: { module: Module; profile: any }) => {
+      console.log("🔍 Starting module completion...", {
+        moduleId: module.id,
+        profileId: profile.id
+      });
+
+      // Check if module exists
+      const { data: existingModule } = await supabase
+        .from("user_module_progress")
+        .select("module_id, is_completed")
+        .eq("module_id", module.id)
+        .single();
+
+      const { interest, ...moduleData } = module;
+      const moduleToInsert = {
+        user_id: profile.id,
+        module_id: module.id,
+        title: module.title,
+        description: module.description,
+        difficulty: module.difficulty,
+        estimated_duration: module.estimated_duration,
+        points_reward: module.points_reward,
+        progress_percentage: 100,
+        is_completed: true,
+        detailed_content: module.detailed_content
+      };
+
+      if (!existingModule) {
+        // Create new completed module
+        const { error: insertError } = await supabase
+          .from("user_module_progress")
+          .insert(moduleToInsert);
+
+        if (insertError) throw insertError;
+      } else {
+        // Update existing module
+        const { error: updateError } = await supabase
+          .from("user_module_progress")
+          .update({ 
+            progress_percentage: 100, 
+            is_completed: true 
+          })
+          .eq("module_id", module.id);
+
+        if (updateError) throw updateError;
+      }
+
+      // Award points
+      const newPoints = (profile.total_points || 0) + module.points_reward;
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .update({ total_points: newPoints })
+        .eq("id", profile.id);
+
+      if (profileError) throw profileError;
+
+      return { newPoints };
+    },
+    onSuccess: (data, variables) => {
+      // Update local state
+      queryClient.invalidateQueries({ queryKey: ['profile'] });
+      queryClient.invalidateQueries({ queryKey: ['modules'] });
+      
+      toast.success(`Module completed! 🎉 +${variables.module.points_reward} points earned!`);
+      closeModule();
+    },
+    onError: (error: any) => {
+      console.error("💥 Error completing module:", error);
+      toast.error(`Failed to complete module: ${error.message}`);
+    },
+  });
+
+  const openModule = async (module: Module) => {
+    setModuleLoading(module.id);
+    setSelectedModule(module);
+    
+    // Reset quiz state
+    setAnswers({});
+    setQuizResults({});
+    setCompletedQuizzes(new Set());
+
+    // Generate quizzes if needed
+    if (!module.quizzes || module.quizzes.length === 0) {
+      console.log("🎯 Generating quizzes for module:", module.title);
+      const quizzes = await generateQuizzesForModule(module);
+      
+      setSelectedModule(prev => prev ? { ...prev, quizzes } : null);
+    }
+    
+    setModuleLoading(null);
+  };
+
+  const closeModule = () => {
+    setSelectedModule(null);
+    setModuleLoading(null);
+    setCompletingModule(false);
+  };
+
+  const markModuleComplete = async () => {
+    if (!selectedModule || !profile) {
+      toast.error("No module or profile selected");
+      return;
+    }
+
+    setCompletingModule(true);
+    try {
+      await completeModuleMutation.mutateAsync({ module: selectedModule, profile });
+    } finally {
+      setCompletingModule(false);
+    }
+  };
+
+  const generateQuizzesForModule = async (module: Module): Promise<QuizQuestion[]> => {
+    console.log("🔄 Using fallback quizzes");
+    return [
+      {
+        id: `quiz_${module.id}_1`,
+        question: `What is the main focus of ${module.title}?`,
+        options: [
+          "Understanding fundamental concepts and practical applications",
+          "Advanced technical details and complex theories", 
+          "Historical background and development",
+          "Future predictions and trends"
+        ],
+        correct_answer: "Understanding fundamental concepts and practical applications"
+      },
+      {
+        id: `quiz_${module.id}_2`,
+        question: `Which approach is most effective for learning ${module.title}?`,
+        options: [
+          "Regular practice and hands-on exercises",
+          "Theoretical study and memorization",
+          "Advanced tools and software",
+          "Professional certifications"
+        ],
+        correct_answer: "Regular practice and hands-on exercises"
+      }
+    ];
+  };
+
+  const handleAnswerSelect = (quizId: string, answer: string) => {
+    if (selectedModule?.is_completed) {
+      toast.info("This module is completed. You cannot change answers.");
+      return;
+    }
+    setAnswers(prev => ({ ...prev, [quizId]: answer }));
+  };
+
+  const submitQuizAnswer = async (quiz: QuizQuestion) => {
+    if (!selectedModule || selectedModule.is_completed) {
+      toast.info("This module is completed. You cannot submit answers.");
+      return;
+    }
+
+    const userAnswer = answers[quiz.id];
+    if (!userAnswer) {
+      toast.error("Please select an answer");
+      return;
+    }
+
+    const isCorrect = userAnswer === quiz.correct_answer;
+    setQuizResults(prev => ({ ...prev, [quiz.id]: isCorrect }));
+    setCompletedQuizzes(prev => new Set(prev).add(quiz.id));
+
+    if (isCorrect) {
+      toast.success("✅ Correct answer!");
+      
+      // Award quiz points
+      const quizPoints = 5;
+      const newPoints = (profile?.total_points || 0) + quizPoints;
+      
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .update({ total_points: newPoints })
+        .eq("id", profile.id);
+
+      if (!profileError) {
+        queryClient.invalidateQueries({ queryKey: ['profile'] });
+        toast.success(`+${quizPoints} points for correct answer!`);
+      }
+
+      // Update progress
+      const moduleQuizzes = selectedModule.quizzes || [];
+      const completedCount = completedQuizzes.size + 1;
+      const progressPercentage = Math.min(
+        Math.floor((completedCount / moduleQuizzes.length) * 100),
+        100
+      );
+
+      const { error } = await supabase
+        .from("user_module_progress")
+        .update({ progress_percentage: progressPercentage })
+        .eq("module_id", selectedModule.id);
+
+      if (!error) {
+        queryClient.invalidateQueries({ queryKey: ['modules'] });
+        
+        if (progressPercentage === 100) {
+          setTimeout(() => {
+            toast.success("All quizzes completed! Module finished! 🎉");
+          }, 1000);
+        }
+      }
+    } else {
+      toast.error("❌ Incorrect answer. Try again!");
+    }
+  };
+
+  const calculateDayStreak = () => profile?.streak_days || 0;
+
+  const loading = profileLoading || modulesLoading;
+
+  if (loading)
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-pulse text-2xl text-primary">Loading...</div>
+      </div>
+    );
+
+  // Debug render to check if data is available
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-primary/5 via-background to-secondary/5">
+      {/* Debug header - remove this after testing */}
+      <div className="bg-blue-50 border-b border-blue-200 p-4">
+        <div className="container mx-auto">
+          <p className="text-sm text-blue-800">
+            <strong>Debug Info:</strong> Profile: {profile ? 'Loaded' : 'Missing'}, 
+            Modules: {modules?.length || 0}, 
+            User: {profile?.full_name || 'Unknown'}
+          </p>
+        </div>
+      </div>
+
+      {/* Header */}
+      <header className="border-b bg-card/50 backdrop-blur-sm sticky top-0 z-50">
+        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-xl bg-gradient-to-br from-primary to-warning">
+              <GraduationCap className="h-6 w-6 text-primary-foreground" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold">AI Learn Tanzania</h1>
+              <p className="text-sm text-muted-foreground">Welcome, {profile?.full_name || 'User'}</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => supabase.auth.signOut().then(() => navigate("/auth"))}
+          >
+            <LogOut className="h-4 w-4 mr-2" /> Sign Out
+          </Button>
+        </div>
+      </header>
+
+      {/* Stats */}
+      <main className="container mx-auto px-4 py-8">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+          <Card>
+            <CardContent className="pt-6 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Total Points</p>
+                <p className="text-3xl font-bold text-primary">{profile?.total_points || 0}</p>
+              </div>
+              <Trophy className="h-6 w-6 text-primary p-3 rounded-full bg-primary/10" />
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Day Streak</p>
+                <p className="text-3xl font-bold text-warning">{calculateDayStreak()}</p>
+              </div>
+              <Flame className="h-6 w-6 text-warning p-3 rounded-full bg-warning/10" />
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Skill Level</p>
+                <Badge variant="secondary">{profile?.skill_level || "beginner"}</Badge>
+              </div>
+              <Award className="h-6 w-6 text-secondary p-3 rounded-full bg-secondary/10" />
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Learning Modules */}
+        <div className="space-y-6">
+          <h2 className="text-2xl font-bold flex items-center gap-2">
+            <BookOpen className="h-6 w-6 text-primary" /> Your Learning Path
+          </h2>
+
+          {!modules || modules.length === 0 ? (
+            <Card>
+              <CardContent className="pt-6 text-center">
+                <p className="text-muted-foreground mb-4">
+                  {generateModulesMutation.isPending ? "Generating your learning modules..." : "No learning modules found."}
+                </p>
+                <Button 
+                  onClick={() => profile && generateModulesMutation.mutate(profile.id)} 
+                  className="mt-4"
+                  disabled={generateModulesMutation.isPending || !profile}
+                >
+                  {generateModulesMutation.isPending ? (
+                    <>
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                      Generating...
+                    </>
+                  ) : (
+                    "Generate Learning Modules"
+                  )}
+                </Button>
+              </CardContent>
+            </Card>
+          ) : (
+            modules.map((module) => (
+              <Card key={module.id} className="shadow-soft hover:shadow-medium transition-all">
+                <CardHeader>
+                  <div className="flex items-start justify-between">
+                    <div className="flex-1">
+                      <CardTitle>{module.title}</CardTitle>
+                      <CardDescription>{module.description}</CardDescription>
+                    </div>
+                    <div className="flex flex-col items-end gap-2">
+                      <Badge variant={module.difficulty === "beginner" ? "secondary" : "default"}>
+                        {module.difficulty}
+                      </Badge>
+                      {module.interest && (
+                        <Badge variant="outline" className="text-xs">
+                          {module.interest}
+                        </Badge>
+                      )}
+                    </div>
+                  </div>
+                </CardHeader>
+
+                <CardContent>
+                  <div className="flex items-center justify-between mb-4">
+                    <Progress value={module.progress_percentage} className="flex-1 mr-4" />
+                    <span className="text-sm font-medium">{module.progress_percentage}%</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4 mb-4 text-sm">
+                    <div className="text-center p-2 bg-muted rounded-lg">
+                      <p className="font-semibold">Duration</p>
+                      <p>{module.estimated_duration} min</p>
+                    </div>
+                    <div className="text-center p-2 bg-muted rounded-lg">
+                      <p className="font-semibold">Points Reward</p>
+                      <p>{module.points_reward}</p>
+                    </div>
+                  </div>
+
+                  <Button 
+                    onClick={() => openModule(module)} 
+                    className="w-full"
+                    size="lg"
+                    disabled={moduleLoading === module.id}
+                  >
+                    <BookOpen className="h-4 w-4 mr-2" />
+                    {moduleLoading === module.id ? "Loading..." : "Open Module"}
+                  </Button>
+                </CardContent>
+              </Card>
+            ))
+          )}
+        </div>
+      </main>
+
+      {/* Module Dialog - Keep your existing dialog code */}
+      <Dialog open={!!selectedModule} onOpenChange={(open) => !open && closeModule()}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center justify-between">
+              <span>{selectedModule?.title}</span>
+              <Button variant="ghost" size="icon" onClick={closeModule}>
+                <X className="h-4 w-4" />
+              </Button>
+            </DialogTitle>
+          </DialogHeader>
+
+          {selectedModule && (
+            <div className="space-y-6">
+              {/* Your existing dialog content remains the same */}
+              {/* ... (keep all your existing dialog JSX) ... */}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+};
+
+export default Dashboard;
